@@ -61,6 +61,11 @@ const STAT_KEYS = [
   { key: "street", label: "STREET" }
 ];
 
+const NPC_TAGS = ["Unknown", "Neutral", "Allied", "Enemy", "Contact", "Vendor", "Faction", "Dangerous", "Deceased"];
+const MAX_JOURNAL_NPCS = 24;
+const MAX_JOURNAL_PLACES = 24;
+const MAX_MEMORY_FACTS = 36;
+const MAX_MEMORY_THREADS = 18;
 const SAVE_VERSION = 1;
 const SAVE_KEY_PREFIX = "voidline.local";
 const AUTO_SAVE_EVERY_TURNS = 3;
@@ -108,6 +113,7 @@ GAME MECHANICS (track these rigorously):
   * STREET: contacts, reputation, negotiation, scams, reading danger
 - Time advances with nearly every action. Brief speech or quick checks cost 1-5 minutes, tense talks cost 5-20, searching or hacking costs 10-45, travel costs 20-120, medical work or repairs cost 15-180, and rest can cost hours.
 - Inventory: items can be acquired, used, lost, sold
+- Journal memory tracks only NPCs the player has directly met, places the player has visited, stable canon facts, and open plot threads. Use it to avoid contradictions.
 
 PLAYER AGENCY GUARDRAILS:
 - The player declares intent only. They cannot declare success, NPC actions, scene facts, hidden information, new exits, loot, credits, healing, lowered HEAT, faction support, or consequences.
@@ -117,6 +123,9 @@ PLAYER AGENCY GUARDRAILS:
 - Only add items in itemsGained when your narrative actually grants them through a plausible event. Never grant an item simply because the player declared they had it.
 - Only list itemsLost using exact item names from the current inventory.
 - If an action tries to control too much, narrow it to an attempted action and resolve uncertainty yourself as the GM.
+- Do not add NPCs to journalUpdates unless the player directly meets or meaningfully interacts with them in the scene. Rumors, unseen names, and background mentions are canonFacts or openThreads, not met NPCs.
+- Do not add places to journalUpdates unless the player physically visits them or meaningfully accesses them through the action.
+- Preserve established canon. If a new result would contradict journal memory, explain the apparent contradiction in-world or avoid it.
 
 RESPONSE FORMAT — Always structure your response as valid JSON:
 {
@@ -125,9 +134,17 @@ RESPONSE FORMAT — Always structure your response as valid JSON:
   "creditsDelta": number,
   "heatDelta": number (can be negative if player lays low),
   "timeDeltaMinutes": number (0 or positive integer minutes consumed by the action),
+  "location": "current location after the action, or empty string if unchanged",
   "itemsGained": ["item name"],
   "itemsLost": ["item name"],
   "statChanges": {"body": 0, "reflex": 0, "tech": 0, "net": 0, "street": 0},
+  "journalUpdates": {
+    "npcs": [{"name": "NPC name", "tag": "Unknown|Neutral|Allied|Enemy|Contact|Vendor|Faction|Dangerous|Deceased", "faction": "optional", "role": "optional", "notes": "short update", "lastSeen": "where/when"}],
+    "places": [{"name": "place name", "district": "district name", "notes": "short update"}],
+    "canonFacts": ["stable fact established this turn"],
+    "openThreads": ["unresolved promise, threat, mystery, debt, clue, or objective"],
+    "resolvedThreads": ["short text matching or summarizing a resolved open thread"]
+  },
   "isDead": boolean,
   "deathMessage": "Only if isDead is true — one brutal sentence about how they died.",
   "gmNote": "Optional short OOC note about dice rolls or mechanics"
@@ -176,6 +193,20 @@ function hpColor(hp, maxHp) {
   if (pct > 0.6) return "#06d6a0";
   if (pct > 0.3) return "#ffd166";
   return "#ff2d55";
+}
+
+function npcTagColor(tag) {
+  switch (tag) {
+    case "Allied": return "#06d6a0";
+    case "Enemy": return "#ff2d55";
+    case "Contact": return "#00f5d4";
+    case "Vendor": return "#ffd166";
+    case "Faction": return "#9b5de5";
+    case "Dangerous": return "#f77f00";
+    case "Deceased": return "#777";
+    case "Neutral": return "#ccc";
+    default: return "#555";
+  }
 }
 
 function clampStat(value) {
@@ -245,6 +276,161 @@ function normalizeItems(items) {
 function filterExistingItems(items, inventory) {
   const inventorySet = new Set(inventory);
   return normalizeItems(items).filter(item => inventorySet.has(item));
+}
+
+function cleanJournalText(value, maxLength = 220) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function normalizeNpcTag(tag) {
+  const cleaned = cleanJournalText(tag, 30).toLowerCase();
+  return NPC_TAGS.find(t => t.toLowerCase() === cleaned) || "Unknown";
+}
+
+function createInitialJournal(location, timeLabel) {
+  return {
+    npcs: [],
+    places: location ? [{
+      name: location,
+      district: location,
+      notes: "Starting location.",
+      firstVisited: timeLabel,
+      lastVisited: timeLabel,
+      visitCount: 1
+    }] : [],
+    canonFacts: [],
+    openThreads: []
+  };
+}
+
+function normalizeJournal(journal) {
+  const source = journal && typeof journal === "object" ? journal : {};
+  return {
+    npcs: Array.isArray(source.npcs) ? source.npcs
+      .map(npc => ({
+        name: cleanJournalText(npc?.name, 80),
+        tag: normalizeNpcTag(npc?.tag),
+        faction: cleanJournalText(npc?.faction, 80),
+        role: cleanJournalText(npc?.role, 80),
+        notes: cleanJournalText(npc?.notes),
+        lastSeen: cleanJournalText(npc?.lastSeen, 120),
+        firstMet: cleanJournalText(npc?.firstMet, 80),
+        lastMetTurn: Number(npc?.lastMetTurn) || 0
+      }))
+      .filter(npc => npc.name)
+      .slice(-MAX_JOURNAL_NPCS) : [],
+    places: Array.isArray(source.places) ? source.places
+      .map(place => ({
+        name: cleanJournalText(place?.name, 90),
+        district: cleanJournalText(place?.district, 90),
+        notes: cleanJournalText(place?.notes),
+        firstVisited: cleanJournalText(place?.firstVisited, 80),
+        lastVisited: cleanJournalText(place?.lastVisited, 80),
+        visitCount: Math.max(1, Number(place?.visitCount) || 1)
+      }))
+      .filter(place => place.name)
+      .slice(-MAX_JOURNAL_PLACES) : [],
+    canonFacts: normalizeItems(source.canonFacts).slice(-MAX_MEMORY_FACTS),
+    openThreads: normalizeItems(source.openThreads).slice(-MAX_MEMORY_THREADS)
+  };
+}
+
+function addUniqueText(items, value, maxItems) {
+  const text = cleanJournalText(value);
+  if (!text) return items;
+  const exists = items.some(item => item.toLowerCase() === text.toLowerCase());
+  return exists ? items : [...items, text].slice(-maxItems);
+}
+
+function mergeJournal(journal, updates, context) {
+  const base = normalizeJournal(journal);
+  const source = updates && typeof updates === "object" ? updates : {};
+  const timeLabel = context?.timeLabel || "";
+  const location = context?.location || "";
+  const turnCount = context?.turnCount || 0;
+
+  const npcsByName = new Map(base.npcs.map(npc => [npc.name.toLowerCase(), npc]));
+  if (Array.isArray(source.npcs)) {
+    source.npcs.forEach(update => {
+      const name = cleanJournalText(update?.name, 80);
+      if (!name) return;
+      const key = name.toLowerCase();
+      const existing = npcsByName.get(key);
+      npcsByName.set(key, {
+        ...(existing || {}),
+        name,
+        tag: normalizeNpcTag(update?.tag || existing?.tag),
+        faction: cleanJournalText(update?.faction, 80) || existing?.faction || "",
+        role: cleanJournalText(update?.role, 80) || existing?.role || "",
+        notes: cleanJournalText(update?.notes) || existing?.notes || "",
+        lastSeen: cleanJournalText(update?.lastSeen, 120) || location || existing?.lastSeen || "",
+        firstMet: existing?.firstMet || timeLabel,
+        lastMetTurn: turnCount
+      });
+    });
+  }
+
+  const placesByName = new Map(base.places.map(place => [place.name.toLowerCase(), place]));
+  if (Array.isArray(source.places)) {
+    source.places.forEach(update => {
+      const name = cleanJournalText(update?.name, 90);
+      if (!name) return;
+      const key = name.toLowerCase();
+      const existing = placesByName.get(key);
+      placesByName.set(key, {
+        ...(existing || {}),
+        name,
+        district: cleanJournalText(update?.district, 90) || existing?.district || name,
+        notes: cleanJournalText(update?.notes) || existing?.notes || "",
+        firstVisited: existing?.firstVisited || timeLabel,
+        lastVisited: timeLabel || existing?.lastVisited || "",
+        visitCount: (existing?.visitCount || 0) + 1
+      });
+    });
+  }
+
+  let canonFacts = [...base.canonFacts];
+  if (Array.isArray(source.canonFacts)) {
+    source.canonFacts.forEach(fact => {
+      canonFacts = addUniqueText(canonFacts, fact, MAX_MEMORY_FACTS);
+    });
+  }
+
+  let openThreads = [...base.openThreads];
+  const resolvedThreads = normalizeItems(source.resolvedThreads);
+  if (resolvedThreads.length) {
+    openThreads = openThreads.filter(thread => !resolvedThreads.some(resolved => {
+      const a = thread.toLowerCase();
+      const b = resolved.toLowerCase();
+      return a === b || a.includes(b) || b.includes(a);
+    }));
+  }
+  if (Array.isArray(source.openThreads)) {
+    source.openThreads.forEach(thread => {
+      openThreads = addUniqueText(openThreads, thread, MAX_MEMORY_THREADS);
+    });
+  }
+
+  return {
+    npcs: Array.from(npcsByName.values()).slice(-MAX_JOURNAL_NPCS),
+    places: Array.from(placesByName.values()).slice(-MAX_JOURNAL_PLACES),
+    canonFacts,
+    openThreads
+  };
+}
+
+function formatJournalForPrompt(journal) {
+  const safe = normalizeJournal(journal);
+  const npcLines = safe.npcs.length
+    ? safe.npcs.map(npc => `- ${npc.name} [${npc.tag}]${npc.role ? ` ${npc.role}` : ""}${npc.faction ? `, ${npc.faction}` : ""}. ${npc.notes || "No notes."}${npc.lastSeen ? ` Last seen: ${npc.lastSeen}.` : ""}`).join("\n")
+    : "None yet.";
+  const placeLines = safe.places.length
+    ? safe.places.map(place => `- ${place.name}${place.district && place.district !== place.name ? ` (${place.district})` : ""}. ${place.notes || "Visited."}${place.lastVisited ? ` Last visited: ${place.lastVisited}.` : ""}`).join("\n")
+    : "None yet.";
+  const factLines = safe.canonFacts.length ? safe.canonFacts.map(fact => `- ${fact}`).join("\n") : "None yet.";
+  const threadLines = safe.openThreads.length ? safe.openThreads.map(thread => `- ${thread}`).join("\n") : "None yet.";
+  return `KNOWN NPCS (met only):\n${npcLines}\n\nVISITED PLACES:\n${placeLines}\n\nCANON FACTS:\n${factLines}\n\nOPEN THREADS:\n${threadLines}`;
 }
 
 function normalizeAccountId(handle) {
@@ -330,6 +516,16 @@ function hydrateCharacter(savedCharacter) {
   const arch = ARCHETYPES.find(a => a.id === archetypeId) || ARCHETYPES[0];
   const { archetype, archetypeId: _archetypeId, ...rest } = savedCharacter;
   const savedClockMinutes = Number(rest.clockMinutes);
+  const day = Math.max(1, Number(rest.day) || 1);
+  const clockMinutes = Number.isFinite(savedClockMinutes) ? Math.min(MINUTES_PER_DAY - 1, Math.max(0, savedClockMinutes)) : START_CLOCK_MINUTES;
+  const baseJournal = normalizeJournal(rest.journal);
+  const journal = baseJournal.places.length
+    ? baseJournal
+    : mergeJournal(baseJournal, { places: [{ name: rest.district || "Unknown", district: rest.district || "Unknown", notes: "Restored save location." }] }, {
+      location: rest.district || "",
+      timeLabel: formatGameTime(day, clockMinutes),
+      turnCount: Number(rest.history?.length) || 0
+    });
   const migratedStats = STAT_KEYS.reduce((acc, { key }) => {
     acc[key] = Number(rest[key] ?? arch.stats[key]) || 0;
     return acc;
@@ -339,8 +535,9 @@ function hydrateCharacter(savedCharacter) {
     ...rest,
     ...migratedStats,
     archetype: arch,
-    day: Math.max(1, Number(rest.day) || 1),
-    clockMinutes: Number.isFinite(savedClockMinutes) ? Math.min(MINUTES_PER_DAY - 1, Math.max(0, savedClockMinutes)) : START_CLOCK_MINUTES,
+    day,
+    clockMinutes,
+    journal,
     inventory: Array.isArray(rest.inventory) ? rest.inventory : [...arch.startingGear],
     history: Array.isArray(rest.history) ? rest.history : []
   };
@@ -419,6 +616,7 @@ export default function VoidlineRPG() {
   const [turnCount, setTurnCount] = useState(0);
   const [showInventory, setShowInventory] = useState(false);
   const [showLog, setShowLog] = useState(false);
+  const [showJournal, setShowJournal] = useState(false);
   const [bootPhase, setBootPhase] = useState(0);
   const [saveStatus, setSaveStatus] = useState("");
   const [lastSavedAt, setLastSavedAt] = useState("");
@@ -515,6 +713,7 @@ export default function VoidlineRPG() {
     setPlayerName("");
     setShowInventory(false);
     setShowLog(false);
+    setShowJournal(false);
     setBootPhase(0);
     setSaveStatus("");
     setLastSavedAt("");
@@ -541,7 +740,8 @@ export default function VoidlineRPG() {
       ...JSON.parse(JSON.stringify(arch.stats)),
       inventory: [...arch.startingGear],
       district: district.name, history: [],
-      day: 1, clockMinutes: START_CLOCK_MINUTES
+      day: 1, clockMinutes: START_CLOCK_MINUTES,
+      journal: createInitialJournal(district.name, formatGameTime(1, START_CLOCK_MINUTES))
     };
     const introMessage = {
       role: "system_intro",
@@ -575,6 +775,7 @@ export default function VoidlineRPG() {
 
     const inventoryText = character.inventory.length > 0 ? character.inventory.join(", ") : "Nothing";
     const statText = STAT_KEYS.map(({ key, label }) => `${label}: ${character[key]}`).join(" | ");
+    const journalText = formatJournalForPrompt(character.journal);
 
     if (/^\/gm(\s|$)/i.test(action)) {
       const question = action.slice(3).trim();
@@ -602,6 +803,9 @@ Time: ${formatGameTime(character.day, character.clockMinutes)}
 Location: ${character.district}
 Inventory: ${inventoryText}
 Turn: ${turnCount}
+
+JOURNAL MEMORY:
+${journalText}
 
 RECENT HISTORY:
 ${character.history.slice(-6).join("\n") || "Fresh start."}
@@ -647,6 +851,9 @@ Location: ${character.district}
 Inventory: ${inventoryText}
 Turn: ${turnCount + 1}
 
+JOURNAL MEMORY:
+${journalText}
+
 PLAYER ACTION GUARDRAILS:
 - Treat PLAYER ACTION as an attempted action, not established fact.
 - The player currently owns only these inventory items: ${inventoryText}.
@@ -654,6 +861,9 @@ PLAYER ACTION GUARDRAILS:
 - Do not add items, credits, healing, lowered HEAT, faction help, or scene advantages unless your narrative earns them through risk, cost, trade, discovery, or consequence.
 - If the player overreaches, narrow the action to what they can actually attempt and resolve the result yourself.
 - Return timeDeltaMinutes for the real time consumed by the attempted action. Time cannot move backward.
+- Return location only when the player actually changes location or gains meaningful remote access to a place.
+- Return journalUpdates only for new or changed NPC/place/canon/thread information from this turn.
+- Keep continuity with JOURNAL MEMORY. Do not contradict canonFacts or established NPC/place details unless the narrative explains why the apparent contradiction exists.
 
 RECENT HISTORY:
 ${character.history.slice(-4).join("\n") || "Fresh start."}
@@ -677,7 +887,21 @@ Respond as the GM. Return only JSON.`;
       }, {});
       const nextHp = Math.min(character.maxHp, Math.max(0, character.hp + hpDelta));
       const isDead = Boolean(parsed.isDead) || nextHp <= 0;
+      const nextTurnCount = turnCount + 1;
       const nextTime = advanceGameTime(character.day, character.clockMinutes, timeDelta);
+      const nextLocation = cleanJournalText(parsed.location, 90) || character.district;
+      const journalUpdates = parsed.journalUpdates && typeof parsed.journalUpdates === "object" ? { ...parsed.journalUpdates } : {};
+      if (nextLocation !== character.district) {
+        journalUpdates.places = [
+          ...(Array.isArray(journalUpdates.places) ? journalUpdates.places : []),
+          { name: nextLocation, district: nextLocation, notes: "Arrived during play." }
+        ];
+      }
+      const updatedJournal = mergeJournal(character.journal, journalUpdates, {
+        location: nextLocation,
+        timeLabel: formatGameTime(nextTime.day, nextTime.clockMinutes),
+        turnCount: nextTurnCount
+      });
       const newCredits = Math.max(0, character.credits + creditsDelta);
       const newHeat = Math.min(100, Math.max(0, character.heat + heatDelta));
       let newInventory = [...character.inventory];
@@ -687,7 +911,6 @@ Respond as the GM. Return only JSON.`;
         acc[key] = clampStat((character[key] || 0) + statDeltas[key]);
         return acc;
       }, {});
-      const nextTurnCount = turnCount + 1;
       const updatedCharacter = {
         ...character,
         hp: nextHp,
@@ -695,6 +918,8 @@ Respond as the GM. Return only JSON.`;
         heat: newHeat,
         day: nextTime.day,
         clockMinutes: nextTime.clockMinutes,
+        district: nextLocation,
+        journal: updatedJournal,
         inventory: newInventory,
         ...newStats,
         history: [...character.history, `T${nextTurnCount}: ${action.substring(0, 60)}`].slice(-20)
@@ -763,6 +988,8 @@ Respond as the GM. Return only JSON.`;
 
   const arch = character?.archetype;
   const hc = heatColor(character?.heat || 0);
+  const journal = normalizeJournal(character?.journal);
+  const journalCount = journal.npcs.length + journal.places.length;
 
   return (
     <div style={styles.gameRoot}>
@@ -833,6 +1060,48 @@ Respond as the GM. Return only JSON.`;
             {character?.history?.slice().reverse().map((h, i) => (
               <div key={i} style={{ ...styles.invItem, color: "#444", fontSize: 11 }}>{h}</div>
             ))}
+          </div>
+        )}
+        <button style={{ ...styles.sideBtn, borderColor: "#4285f4", color: "#4285f4", marginTop: 6 }} onClick={() => setShowJournal(!showJournal)}>
+          {showJournal ? "▲" : "▼"} JOURNAL ({journalCount})
+        </button>
+        {showJournal && (
+          <div style={styles.journalPanel}>
+            <div style={styles.journalSectionLabel}>NPCS</div>
+            {journal.npcs.length === 0
+              ? <div style={styles.emptyJournalText}>No important NPCs met.</div>
+              : journal.npcs.map(npc => (
+                <div key={npc.name} style={styles.journalEntry}>
+                  <div style={styles.journalEntryHeader}>
+                    <span style={styles.journalName}>{npc.name}</span>
+                    <span style={{ ...styles.journalTag, color: npcTagColor(npc.tag), borderColor: npcTagColor(npc.tag) }}>{npc.tag}</span>
+                  </div>
+                  {(npc.role || npc.faction) && <div style={styles.journalMeta}>{[npc.role, npc.faction].filter(Boolean).join(" // ")}</div>}
+                  {npc.notes && <div style={styles.journalNote}>{npc.notes}</div>}
+                  {npc.lastSeen && <div style={styles.journalMeta}>Last seen: {npc.lastSeen}</div>}
+                </div>
+              ))}
+
+            <div style={styles.journalSectionLabel}>PLACES</div>
+            {journal.places.length === 0
+              ? <div style={styles.emptyJournalText}>No places logged.</div>
+              : journal.places.map(place => (
+                <div key={place.name} style={styles.journalEntry}>
+                  <div style={styles.journalName}>{place.name}</div>
+                  {place.notes && <div style={styles.journalNote}>{place.notes}</div>}
+                  {place.lastVisited && <div style={styles.journalMeta}>Visited: {place.lastVisited}</div>}
+                </div>
+              ))}
+
+            <div style={styles.journalSectionLabel}>CANON</div>
+            {journal.canonFacts.length === 0
+              ? <div style={styles.emptyJournalText}>No locked facts yet.</div>
+              : journal.canonFacts.slice(-6).map((fact, i) => <div key={i} style={styles.memoryLine}>{fact}</div>)}
+
+            <div style={styles.journalSectionLabel}>THREADS</div>
+            {journal.openThreads.length === 0
+              ? <div style={styles.emptyJournalText}>No open threads.</div>
+              : journal.openThreads.slice(-6).map((thread, i) => <div key={i} style={styles.memoryLine}>{thread}</div>)}
           </div>
         )}
         <div style={{ marginTop: "auto", paddingTop: 16 }}>
@@ -1166,6 +1435,16 @@ const styles = {
   sideBtn: { background: "transparent", border: "1px solid", padding: "6px 10px", cursor: "pointer", fontFamily: "'Share Tech Mono', monospace", fontSize: 10, letterSpacing: 2, textAlign: "left", borderRadius: 2, marginTop: 4 },
   inventoryList: { padding: "8px 4px", display: "flex", flexDirection: "column", gap: 4 },
   invItem: { color: "#888", fontSize: 12, fontFamily: "'Rajdhani', sans-serif", display: "flex", alignItems: "center" },
+  journalPanel: { padding: "8px 4px", display: "flex", flexDirection: "column", gap: 8 },
+  journalSectionLabel: { color: "#4285f4", fontSize: 9, fontFamily: "'Share Tech Mono', monospace", letterSpacing: 2, marginTop: 4 },
+  journalEntry: { background: "#0b0b0b", border: "1px solid #171717", borderRadius: 4, padding: "8px", display: "flex", flexDirection: "column", gap: 4 },
+  journalEntryHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 },
+  journalName: { color: "#ccc", fontSize: 12, fontFamily: "'Rajdhani', sans-serif", fontWeight: 700 },
+  journalTag: { fontSize: 8, fontFamily: "'Share Tech Mono', monospace", letterSpacing: 1, border: "1px solid", borderRadius: 2, padding: "1px 4px", whiteSpace: "nowrap" },
+  journalMeta: { color: "#555", fontSize: 10, fontFamily: "monospace", lineHeight: 1.4 },
+  journalNote: { color: "#888", fontSize: 11, fontFamily: "'Rajdhani', sans-serif", lineHeight: 1.4 },
+  memoryLine: { color: "#777", fontSize: 11, fontFamily: "'Rajdhani', sans-serif", lineHeight: 1.4, borderLeft: "1px solid #222", paddingLeft: 6 },
+  emptyJournalText: { color: "#444", fontSize: 11, fontFamily: "monospace" },
   main: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" },
   feedHeader: { padding: "12px 20px", borderBottom: "1px solid #111", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#070707" },
   feed: { flex: 1, overflowY: "auto", padding: "24px 28px", display: "flex", flexDirection: "column", gap: 16 },
